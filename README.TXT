@@ -1,5 +1,5 @@
 --------------------------------------------------------------
-ASM6N (v1.7.2)
+ASM6N (v1.7.3)
 A 6502 assembler by loopy (loopy at mm.st)
 With modifications by never-obsolete, freem, nicklausw, and Sour
 --------------------------------------------------------------
@@ -12,6 +12,9 @@ original README for further details on usage.
 --------------------------------------------------------------
 Additions
 --------------------------------------------------------------
+
+ v 1.7.3
+	* Added support to export label sizes in RAM,SRAM,WRAM blocks
 
  v 1.7.2
 	* Added REG directive

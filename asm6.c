@@ -1,6 +1,9 @@
 
 
 /*  asm6n History:
+1.7.3
+	* Added support for label sizes (RAM,SRAM,WRAM blocks only)
+
 1.7.2
 	* Added REG directive
 	* Added DH2 and DH3 directives
@@ -56,7 +59,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-#define VERSION "1.7.2"
+#define VERSION "1.7.3"
 
 #define addr firstlabel.value	//'$' value
 #define NOORIGIN -0x40000000	//nice even number so aligning works before origin is defined
@@ -99,6 +102,7 @@ typedef struct {
     int type;               //labeltypes enum (see above)
     int subtype;			//labelsubtypes enum (see above)
     int bank;				//bank number
+	int size;				//size (for RAM,WRAM,SRAM)
     int used;               //for EQU and MACRO recursion check
     int pass;               //when label was last defined
     int scope;              //where visible (0=global, nonzero=local)
@@ -113,6 +117,7 @@ label firstlabel={		//'$' label
     VALUE,				//type
 	NONE,				//subtype
 	0,					//bank
+	0,					//size
     0,					//used
     0,					//pass
     0,					//scope
@@ -470,7 +475,7 @@ int labels;					//# of labels in labellist
 int maxlabels;				//max # of labels labellist can hold
 int labelstart;				//index of first label
 int labelend;				//index of last label
-label *lastlabel;			//last label created
+label *lastlabel=0;			//last label created
 int nooutput=0;				//supress output (use with ENUM)
 int defaultfiller;			//default fill value
 int insidemacro=0;			//macro/rept is being expanded
@@ -480,10 +485,12 @@ int genmesenlabels=0; 		// generate label file for use with Mesen
 int mesenskiplocal=0;		//
 int genlualabels=0;			// generate ram label file for use with lua
 int patchrom=0;				// patch an ines rom
+long romfilesize=0;			// size of rom data
 char *romfile=NULL;			// rom data
 int labelsubtype=NONE;		// controls what type of label is being defined
 int filepos=0;
 int banknumber=-1;
+int addtolabelsize=0;		// add the size of output to 'lastlabel' size
 
 static void* ptr_from_bool( int b )
 {
@@ -1154,12 +1161,13 @@ void addlabel(char *word, int local) {
         (*labelhere).type=LABEL;				// assume it's a label.. could mutate into something else later
         (*labelhere).subtype=labelsubtype;		// set subtype
         (*labelhere).bank=banknumber;			// set bank
+		(*labelhere).size=0;					// set default size
         (*labelhere).pass=pass;
         (*labelhere).value=addr;
         (*labelhere).line=ptr_from_bool(addr>=0);
         (*labelhere).used=0;
 		(*labelhere).pos=filepos;
-		
+
         if(c==LOCALCHAR || local) { //local
             (*labelhere).scope=scope;
         } else {        //global
@@ -1532,6 +1540,7 @@ int comparelabels(const void* arg1, const void* arg2)
 void export_mesenlabels() 
 {
 	int i;
+	unsigned int ram_addr, ram_len;
 	label *l;
 	char str[512];
 	char filename[512];
@@ -1565,15 +1574,38 @@ void export_mesenlabels()
 		{
 			if (l->subtype == NONE)
 				sprintf(str, "P:%04X:%s\n", (unsigned int)(l->pos - 16), l->name);
-			else if (l->subtype == RAM)
-				sprintf(str, "R:%04X:%s\n", (unsigned int)l->value, l->name);
-			else if (l->subtype == WRAM)
-				sprintf(str, "W:%04X:%s\n", (unsigned int)l->value - 0x6000, l->name);
-			else if (l->subtype == SRAM)
-				sprintf(str, "S:%04X:%s\n", (unsigned int)l->value - 0x6000, l->name);
 			else
-				continue;
-			
+			{
+				ram_addr = (unsigned int)(l->value);
+				ram_len  = (unsigned int)(l->size - 1);
+				if (l->subtype == RAM)
+				{
+					if (l->size > 1)
+						sprintf(str, "R:%04X-%04X:%s\n", ram_addr, ram_addr + ram_len, l->name);
+					else
+						sprintf(str, "R:%04X:%s\n", ram_addr, l->name);
+				}
+				else
+				{
+					ram_addr = (ram_addr - 0x6000) + (l->bank * 0x2000);
+					if (l->subtype == WRAM)
+					{
+						if (l->size > 1)
+							sprintf(str, "W:%04X-%04X:%s\n", ram_addr, ram_addr + ram_len, l->name);
+						else
+							sprintf(str, "W:%04X:%s\n", ram_addr, l->name);
+					}
+					else if (l->subtype == SRAM)
+					{
+						if (l->size > 1)
+							sprintf(str, "S:%04X-%04X:%s\n", ram_addr, ram_addr + ram_len, l->name);
+						else
+							sprintf(str, "S:%04X:%s\n", ram_addr, l->name);
+					}
+					else
+						continue;
+				}
+			}
 			fwrite((const void *)str, 1, strlen(str), outfile);
 		}
 		else if ( (l->type == EQUATE) && (l->subtype == REGISTER) )
@@ -1635,7 +1667,6 @@ void export_lualabels()
 }
 
 void readrom(char *filename) {
-    long filesize;
     FILE *f=0;
 	size_t result;
 
@@ -1645,16 +1676,16 @@ void readrom(char *filename) {
 	{
 		// get size
 		fseek(f,0,SEEK_END);
-		filesize=ftell(f);
+		romfilesize=ftell(f);
 		// allocate memory
-		romfile = my_malloc(filesize);
+		romfile = my_malloc(romfilesize);
 		if (romfile != NULL)
 		{
 			// read rom file
 			fseek(f,0,SEEK_SET);
-			result=fread(romfile,1,filesize,f);
+			result=fread(romfile,1,romfilesize,f);
 			
-			if (result != filesize)
+			if (result != romfilesize)
 				errmsg=ReadError;
 		}
 	}
@@ -1879,6 +1910,9 @@ static void output_le( int n, int size )
     b [0] = n;
     b [1] = n >> 8;
     output( b, size );
+
+	if (lastlabel && addtolabelsize)
+		(*lastlabel).size += size;
 }
 
 /* Outputs integer as big-endian. See readme.txt for proper usage. */
@@ -1888,6 +1922,9 @@ static void output_be( int n, int size )
     b [0] = n >> 8;
     b [1] = n;
     output( b, size );
+	
+	if (lastlabel && addtolabelsize)
+		(*lastlabel).size += size;
 }
 
 //end listing when src=0
@@ -2266,6 +2303,7 @@ void db(label *id,char **next) {
             }
         }
     } while(!errmsg && eatchar(next,','));
+	
 }
 
 void dsw(label *id,char **next) {
@@ -2303,8 +2341,12 @@ void dsb(label *id,char **next) {
     filler(count,next);
 }
 
+
+int save_addtolabelsize;
 void align(label *id,char **next) {
     int count;
+	save_addtolabelsize=addtolabelsize;
+	addtolabelsize=0;
     dependant=0;
     count=eval(next,WHOLEEXP);
     if(count>=0) {
@@ -2312,10 +2354,11 @@ void align(label *id,char **next) {
         else count=0;
     } else count=0;
     filler(count,next);
+	addtolabelsize=save_addtolabelsize;
 }
 
 void pad(label *id, char **next) {
-    int count;
+    int count, val;
     if(addr<0) {
         errmsg=undefinedPC;
     } else {
@@ -2327,7 +2370,10 @@ void pad(label *id, char **next) {
         {
         	while(count--)
         	{
-        		int val = romfile[filepos];
+				if (filepos < romfilesize)
+					val = romfile[filepos];
+				else
+					val = defaultfiller;
         		output_le(val,1);
         	}
         }
@@ -2684,6 +2730,7 @@ void ram(label *id, char **next)
     nooutput=1;
     ram_savesubtype=labelsubtype;
     labelsubtype=RAM;
+	addtolabelsize=1;
 }
 
 void endram(label *id, char **next)
@@ -2695,6 +2742,7 @@ void endram(label *id, char **next)
         errmsg=ExtraENDRAM;
     }
     labelsubtype=ram_savesubtype;
+	addtolabelsize=0;
 }
 
 int wram_saveaddr;
@@ -2712,6 +2760,7 @@ void wram(label *id, char **next)
     nooutput=1;
     wram_savesubtype=labelsubtype;
     labelsubtype=WRAM;
+	addtolabelsize=1;
 }
 
 void endwram(label *id, char **next)
@@ -2723,6 +2772,7 @@ void endwram(label *id, char **next)
         errmsg=ExtraENDWRAM;
     }
     labelsubtype=wram_savesubtype;
+	addtolabelsize=0;
 }
 
 int sram_saveaddr;
@@ -2740,6 +2790,7 @@ void sram(label *id, char **next)
     nooutput=1;
     sram_savesubtype=labelsubtype;
     labelsubtype=SRAM;
+	addtolabelsize=1;
 }
 
 void endsram(label *id, char **next)
@@ -2751,6 +2802,7 @@ void endsram(label *id, char **next)
         errmsg=ExtraENDSRAM;
     }
     labelsubtype=sram_savesubtype;
+	addtolabelsize=0;
 }
 
 
