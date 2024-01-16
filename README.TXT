@@ -1,5 +1,5 @@
 --------------------------------------------------------------
-ASM6N (v1.7.1)
+ASM6N (v1.7.2)
 A 6502 assembler by loopy (loopy at mm.st)
 With modifications by never-obsolete, freem, nicklausw, and Sour
 --------------------------------------------------------------
@@ -12,6 +12,14 @@ original README for further details on usage.
 --------------------------------------------------------------
 Additions
 --------------------------------------------------------------
+
+ v 1.7.2
+	* Added REG directive
+	* Added DH2 and DH3 directives
+	* Added support for patching over an ines rom
+	* Lua switch prints prg-rom labels
+
+ v 1.7.1
 	* Changed BIN directive to work like HEX, but for binary
 	* Added ! operator to force ABS/X/Y instead of ZP/X/Y
 	* Added RAM,ENDRAM, WRAM,ENDWRAM, SRAM,ENDSRAM directives
@@ -33,14 +41,15 @@ Usage:
 
 Options:
 
-        -?         Show some help
-        -l         Create listing
-        -L         Create verbose listing (expand REPT, MACRO)
-        -d<name>:  Define a symbol and make it equal to 1
-	-q         Quiet mode (suppress all output unless there's an error)
-	-m         generate *.mlb file for use with Mesen
-	-M         generate *.mlb file for use with Mesen, ingorning local labels
-	-r         generate *.lua file with all ram/wram/sram labels
+        -?            Show some help
+        -l            Create listing
+        -L            Create verbose listing (expand REPT, MACRO)
+        -d<name>:     Define a symbol and make it equal to 1
+	-q            Quiet mode (suppress all output unless there's an error)
+	-m            generate *.mlb file for use with Mesen
+	-M            generate *.mlb file for use with Mesen, ingorning local labels
+	-r            generate *.lua file with all ram/wram/sram labels
+	-p <romfile>  Patch over a ines rom image.
         Default output is <sourcefile>.bin
         Default listing is <sourcefile>.lst
 
@@ -58,6 +67,23 @@ The ! operator can be used to force absolute addressing.
 Assembler directives
 --------------------------------------------------------------
 
+REG
+	For literal string replacement, used to define hardware registers.
+	These are put in the 'G' section of Mesen's MLB files. 
+	
+		PPU_ADDR REG $2006
+
+
+
+DH2, DH3
+
+        Outputs bits 16-23 and 24-31 (respectively) of a value.
+
+                DH2 a,b,c,d
+                DH3 a,b,c,d
+
+
+
 BIN (use has been changed, INCBIN remains unchanged)
 
 	Compact way of laying out a table of binary values.  Only raw binary values
@@ -69,8 +95,9 @@ BIN (use has been changed, INCBIN remains unchanged)
 
 RAM / ENDRAM, WRAM / ENDWRAM, SRAM / ENDSRAM
 
-	Same function and use as ENUM / ENDE. Labels defined in these blocks
-	will be output with the -r option, ENUM will not.
+	Same function and use as ENUM / ENDE. These are put into the
+	R, W, S (respectively) sections of Mesen's MLB files. Labels defined
+	in these blocks will be output with the -r option, ENUM will not.
 
 
 

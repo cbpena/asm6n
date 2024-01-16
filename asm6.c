@@ -1,8 +1,14 @@
 
 
 /*  asm6n History:
+1.7.2
+	* Added REG directive
+	* Added DH2 and DH3 directives
+	* Added support for patching over an ines rom
+	* Bugfix for macro parameters having a scope/name clash
+
 1.7.1
-	* Added BIN directive
+	* Changed BIN directive
 	* Added ! operator to force ABS/X/Y instead of ZP/X/Y
 	* Added RAM,ENDRAM, WRAM,ENDWRAM, SRAM,ENDSRAM directives
 	* Added RS alias for DSB directive
@@ -50,7 +56,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-#define VERSION "1.7.1"
+#define VERSION "1.7.2"
 
 #define addr firstlabel.value	//'$' value
 #define NOORIGIN -0x40000000	//nice even number so aligning works before origin is defined
@@ -73,12 +79,13 @@ enum labeltypes {LABEL,VALUE,EQUATE,MACRO,RESERVED};
 //MACRO: macro (duh)
 //RESERVED: reserved word
 
-enum labelsubtypes {NONE,CONST,RAM,WRAM,SRAM};
-// NONE:  defined elsewhere
-// CONST: defined in enum/ende
-// RAM:   defined in ram/endram
-// WRAM:  defined in wram/endwram
-// SRAM:  defined in sram/endsram
+enum labelsubtypes {NONE,CONST,RAM,WRAM,SRAM,REGISTER};
+// NONE:		defined elsewhere
+// CONST:		defined in enum/ende
+// RAM:			defined in ram/endram
+// WRAM:		defined in wram/endwram
+// SRAM:		defined in sram/endsram
+// REGISTER:	defined with REG
 
 typedef struct {
     const char *name;       //label name
@@ -133,6 +140,7 @@ void base(label*,char**);
 void bank(label*,char**);
 void pad(label*,char**);
 void equ(label*,char**);
+void reg(label*,char**);
 void equal(label*,char**);
 void nothing(label*,char**);
 void include(label*,char**);
@@ -142,6 +150,8 @@ void dwb(label*,char**);
 void db(label*,char**);
 void dl(label*,char**);
 void dh(label*,char**);
+void dh2(label*,char**);
+void dh3(label*,char**);
 void hex(label*,char**);
 void bin(label*,char**);
 void dsw(label*,char**);
@@ -172,13 +182,18 @@ void make_error(label*,char**);
 void make_message(label*,char**);
 
 // ================================================================================
-//		OPCODE TABLE
+//		ADDRESSING MODES
 // ================================================================================
 enum optypes   {ACC,    IMM,    IND,    INDX,   INDY,   ZPX,    ZPY,    ABSX,   ABSY,   ZP,     ABS,    REL,    IMP,    ZPL,    ZPXL,   ZPYL	};
 int opsize[]  ={0,      1,      2,      1,      1,      1,      1,      2,      2,      1,      2,      1,      0,      2,      2,      2		};
 char ophead[] ={0,      '#',    '(',    '(',    '(',    0,      0,      0,      0,      0,      0,      0,      0,      '!',    '!',    '!'		};
 char *optail[]={"A",    "",     ")",    ",X)",  "),Y",  ",X",   ",Y",   ",X",   ",Y",   "",     "",     "",     "",     "",     ",X",   ",Y"	};
 
+
+
+// ================================================================================
+//		6502 OPCODES
+// ================================================================================
 byte brk[]={0x00,IMM,  0x00,ZP,   0x00,IMP,  -1};
 byte ora[]={0x09,IMM,  0x01,INDX, 0x11,INDY, 0x1d,ZPXL, 0x15,ZPX,  0x1d,ABSX, 0x19,ABSY, 0x0d,ZPL,  0x05,ZP,   0x0d,ABS,  -1};
 byte asl[]={0x0a,ACC,  0x1e,ZPXL, 0x16,ZPX,  0x1e,ABSX, 0x0e,ZPL,  0x06,ZP,   0x0e,ABS,  0x0a,IMP,  -1};
@@ -311,6 +326,7 @@ void *rsvdlist[]={       //all reserved words
         "DEC",dec,
         "INC",inc,
 
+		// illegal opcodes
 		"SLO",slo,
 		"RLA",rla,
 		"SRE",sre,
@@ -325,9 +341,16 @@ void *rsvdlist[]={       //all reserved words
 		"AXS",axs,
 		"LAS",las,
 		
+		// 65816 opcodes
+		
         0, 0
 };
 
+
+
+// ================================================================================
+//		DIRECTIVE TABLE
+// ================================================================================
 struct {
     char* name;
     void (*func)( label*, char** );
@@ -341,6 +364,7 @@ struct {
         "IFNDEF",ifndef,
         "=",equal,
         "EQU",equ,
+    "REG",reg,
         "ORG",org,
         "BASE",base,
         "BANK",bank,
@@ -370,6 +394,8 @@ struct {
         "FILLVALUE",fillval,
         "DL",dl,
         "DH",dh,
+	"DH2", dh2,
+	"DH3", dh3,
         "ERROR",make_error,
 	"PRINT",make_message,
         0, 0
@@ -406,6 +432,7 @@ char NoENDE[]="Missing ENDE.";
 char IfNestLimit[]="Too many nested IFs.";
 char undefinedPC[]="PC is undefined (use ORG first)";
 char BadBankNumber[]="Bank number is invalid.";
+char ReadError[]="Error reading file.";
 
 
 
@@ -449,10 +476,12 @@ int defaultfiller;			//default fill value
 int insidemacro=0;			//macro/rept is being expanded
 int verbose=1;
 
-int genmesenlabels=0; 		//generate label file for use with Mesen
+int genmesenlabels=0; 		// generate label file for use with Mesen
 int mesenskiplocal=0;		//
-int genlualabels=0;			//generate ram label file for use with lua
-int labelsubtype=NONE;		//controls what type of label is being defined
+int genlualabels=0;			// generate ram label file for use with lua
+int patchrom=0;				// patch an ines rom
+char *romfile=NULL;			// rom data
+int labelsubtype=NONE;		// controls what type of label is being defined
 int filepos=0;
 int banknumber=-1;
 
@@ -1536,7 +1565,6 @@ void export_mesenlabels()
 		{
 			if (l->subtype == NONE)
 				sprintf(str, "P:%04X:%s\n", (unsigned int)(l->pos - 16), l->name);
-			//	sprintf(str, "P:%04X:%s\n", (unsigned int)l->value, l->name);
 			else if (l->subtype == RAM)
 				sprintf(str, "R:%04X:%s\n", (unsigned int)l->value, l->name);
 			else if (l->subtype == WRAM)
@@ -1544,7 +1572,13 @@ void export_mesenlabels()
 			else if (l->subtype == SRAM)
 				sprintf(str, "S:%04X:%s\n", (unsigned int)l->value - 0x6000, l->name);
 			else
-				sprintf(str, "G:%04X:%s\n", (unsigned int)l->value, l->name);
+				continue;
+			
+			fwrite((const void *)str, 1, strlen(str), outfile);
+		}
+		else if ( (l->type == EQUATE) && (l->subtype == REGISTER) )
+		{
+			sprintf(str, "G:%04X:%s\n", (unsigned int)l->value, l->name);
 			fwrite((const void *)str, 1, strlen(str), outfile);
 		}
 	}
@@ -1570,6 +1604,10 @@ void export_lualabels()
 		// ignore CHR & anonymous code labels
 		if(l->value >= 0x10000 || l->name[0] == '+' || l->name[0] == '-' || l->value < 0)
 			continue;
+		
+		// ignore local labels
+		if ( l->name[0] == LOCALCHAR )
+			continue;
 
 		if (l->type == LABEL)
 		{
@@ -1581,7 +1619,12 @@ void export_lualabels()
 					sprintf(str, "%s\t\t= 0x%04X\n", l->name, (unsigned int)l->value);
 					fwrite((const void *)str, 1, strlen(str), outfile);
 					break;
-				
+					
+				case NONE:
+					sprintf(str, "%s\t\t= 0x%04X\n", l->name, (unsigned int)(l->pos - 16));
+					fwrite((const void *)str, 1, strlen(str), outfile);
+					break;
+					
 				default:
 					continue;
 			}
@@ -1590,6 +1633,36 @@ void export_lualabels()
 	
 	fclose(outfile);
 }
+
+void readrom(char *filename) {
+    long filesize;
+    FILE *f=0;
+	size_t result;
+
+	if(!(f=fopen(filename,"rb")))
+		fatal_error("Can't open file: %s",filename);
+	else
+	{
+		// get size
+		fseek(f,0,SEEK_END);
+		filesize=ftell(f);
+		// allocate memory
+		romfile = my_malloc(filesize);
+		if (romfile != NULL)
+		{
+			// read rom file
+			fseek(f,0,SEEK_SET);
+			result=fread(romfile,1,filesize,f);
+			
+			if (result != filesize)
+				errmsg=ReadError;
+		}
+	}
+	
+    if(f) fclose(f);
+}
+
+//--------------------------------------------------------------------------------------------
 
 int main(int argc,char **argv) {
     char str[512];
@@ -1638,6 +1711,14 @@ int main(int argc,char **argv) {
 					break;
 				case 'r':
 					genlualabels=1;
+					break;
+				case 'p':
+					i++;
+					if (i<argc)
+					{
+						patchrom=1;
+						readrom(argv[i]);
+					}
 					break;
                 default:
                     fatal_error("unknown option: %s",argv[i]);
@@ -1740,6 +1821,9 @@ int main(int argc,char **argv) {
 	
 	if (genlualabels)
 		export_lualabels();
+	
+	if (patchrom)
+		free(romfile);
         
     return error ? EXIT_FAILURE : 0;
 }
@@ -1870,6 +1954,52 @@ void equ(label *id, char **next) {
             if(*s) {
                 (*labelhere).line=my_strdup(s);
                 (*labelhere).type=EQUATE;
+            } else {
+                errmsg=IncompleteExp;
+            }
+        } else if((*labelhere).type!=EQUATE) {
+            errmsg=LabelDefined;
+        }
+        *s=0;//end line
+    }
+}
+
+void macroequ(label *id, char **next) {
+    char str[LINEMAX];
+    char *s=*next;
+    if(!labelhere)
+        errmsg=NeedName;//EQU without a name
+    else {
+        //if((*labelhere).type==LABEL) {//new EQU.. good
+            reverse(str,s+strspn(s,whitesp));       //eat whitesp off both ends
+            reverse(s,str+strspn(str,whitesp));
+            if(*s) {
+                (*labelhere).line=my_strdup(s);
+                (*labelhere).type=EQUATE;
+            } else {
+                errmsg=IncompleteExp;
+            }
+        //} else if((*labelhere).type!=EQUATE) {
+        //    errmsg=LabelDefined;
+        //}
+        *s=0;//end line
+    }
+}
+
+void reg(label *id, char **next) {
+    char str[LINEMAX];
+    char *s=*next;
+    if(!labelhere)
+        errmsg=NeedName;//EQU without a name
+    else {
+        if((*labelhere).type==LABEL) {//new EQU.. good
+            reverse(str,s+strspn(s,whitesp));       //eat whitesp off both ends
+            reverse(s,str+strspn(str,whitesp));
+            if(*s) {
+                (*labelhere).line=my_strdup(s);
+                (*labelhere).type=EQUATE;
+                (*labelhere).value=eval(next,WHOLEEXP);
+                (*labelhere).subtype=REGISTER;
             } else {
                 errmsg=IncompleteExp;
             }
@@ -2079,6 +2209,24 @@ void dh(label *id, char **next) {
     } while(!errmsg && eatchar(next,','));
 }
 
+void dh2(label *id, char **next) {
+    byte val;
+    do {
+        val=eval(next,WHOLEEXP)>>16;
+        if(!errmsg)
+            output(&val,1);
+    } while(!errmsg && eatchar(next,','));
+}
+
+void dh3(label *id, char **next) {
+    byte val;
+    do {
+        val=eval(next,WHOLEEXP)>>24;
+        if(!errmsg)
+            output(&val,1);
+    } while(!errmsg && eatchar(next,','));
+}
+
 void db(label *id,char **next) {
     int val,val2;
     byte *s,*start;
@@ -2173,7 +2321,16 @@ void pad(label *id, char **next) {
     } else {
         dependant=0;
         count=eval(next,WHOLEEXP)-addr;
-        filler(count,next);
+        if (!patchrom)
+        	filler(count,next);
+        else
+        {
+        	while(count--)
+        	{
+        		int val = romfile[filepos];
+        		output_le(val,1);
+        	}
+        }
     }
 }
 
@@ -2417,7 +2574,7 @@ void expandmacro(label *id,char **next,int errline,char *errsrc) {
         //  equ(0,&s);
             if(arg<args) {              //make named arg
                 addlabel((char*)&line[1],1);
-                equ(0,&s);
+                macroequ(0,&s);
                 line=(char**)*line; //next arg name
             }
             arg++;
