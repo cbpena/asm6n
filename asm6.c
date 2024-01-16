@@ -1,4 +1,21 @@
-/*  History:
+
+
+/*  asm6n History:
+1.7.1
+	* Added BIN directive
+	* Added ! operator to force ABS/X/Y instead of ZP/X/Y
+	* Added RAM,ENDRAM, WRAM,ENDWRAM, SRAM,ENDSRAM directives
+	* Added RS alias for DSB directive
+	* Added WORDB, DWB, DCWB, DC.WB directives
+	* Added BANK directive and ? operator to retrieve a label's bank number
+	* Added PRINT directive
+	* Added support for exporting Mesen (.mlb) label files [based on freem/Sour asm6f code]
+	* Added support for exporting all RAM lables to a lua file
+	* Added support for stable illegal opcodes [based on freem asm6f code]
+*/
+
+
+/*  asm6 History:
 1.6
     Prevent error overload by emitting 2 bytes when branch instructions fail to parse
     Bugfix for negative numbers being parsed incorrectly after too many passes are made
@@ -33,18 +50,19 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-#define VERSION "1.6"
+#define VERSION "1.7.1"
 
-#define addr firstlabel.value//'$' value
-#define NOORIGIN -0x40000000//nice even number so aligning works before origin is defined
-#define INITLISTSIZE 128//initial label list size
-#define BUFFSIZE 8192//file buffer (inputbuff, outputbuff) size
-#define WORDMAX 128     //used with getword()
-#define LINEMAX 2048//plenty of room for nested equates
-#define MAXPASSES 7//# of tries before giving up
-#define IFNESTS 32//max nested IF levels
-#define DEFAULTFILLER 0 //default fill value
+#define addr firstlabel.value	//'$' value
+#define NOORIGIN -0x40000000	//nice even number so aligning works before origin is defined
+#define INITLISTSIZE 128		//initial label list size
+#define BUFFSIZE 8192			//file buffer (inputbuff, outputbuff) size
+#define WORDMAX 128     		//used with getword()
+#define LINEMAX 2048			//plenty of room for nested equates
+#define MAXPASSES 7				//# of tries before giving up
+#define IFNESTS 32				//max nested IF levels
+#define DEFAULTFILLER 0			//default fill value
 #define LOCALCHAR '@'
+#define BANKCHAR '?'			//char for bank# operator
 
 static void* true_ptr = &true_ptr;
 
@@ -54,30 +72,44 @@ enum labeltypes {LABEL,VALUE,EQUATE,MACRO,RESERVED};
 //EQUATE: made with EQU
 //MACRO: macro (duh)
 //RESERVED: reserved word
+
+enum labelsubtypes {NONE,CONST,RAM,WRAM,SRAM};
+// NONE:  defined elsewhere
+// CONST: defined in enum/ende
+// RAM:   defined in ram/endram
+// WRAM:  defined in wram/endwram
+// SRAM:  defined in sram/endsram
+
 typedef struct {
     const char *name;       //label name
     // ptrdiff_t so it can hold function pointer on 64-bit machines
     ptrdiff_t value;        //PC (label), value (equate), param count (macro), funcptr (reserved)
+	int pos;				//location in file; used to determine bank when exporting labels
     char *line;             //for macro or equate, also used to mark unknown label
                             //*next:text->*next:text->..
                             //for macros, the first <value> lines hold param names
                             //for opcodes (reserved), this holds opcode definitions, see initlabels
     int type;               //labeltypes enum (see above)
+    int subtype;			//labelsubtypes enum (see above)
+    int bank;				//bank number
     int used;               //for EQU and MACRO recursion check
     int pass;               //when label was last defined
     int scope;              //where visible (0=global, nonzero=local)
     void *link;             //labels that share the same name (local labels) are chained together
 } label;
 
-label firstlabel={          //'$' label
-    "$",//*name
-    0,//value
-    (char*)&true_ptr,//*line
-    VALUE,//type
-    0,//used
-    0,//pass
-    0,//scope
-    0,//link
+label firstlabel={		//'$' label
+    "$",				//*name
+    0,					//value
+	0,					//pos
+    (char*)&true_ptr,	//*line
+    VALUE,				//type
+	NONE,				//subtype
+	0,					//bank
+    0,					//used
+    0,					//pass
+    0,					//scope
+    0,					//link
 };
 
 typedef unsigned char byte;
@@ -98,6 +130,7 @@ void endlist();
 void opcode(label*,char**);
 void org(label*,char**);
 void base(label*,char**);
+void bank(label*,char**);
 void pad(label*,char**);
 void equ(label*,char**);
 void equal(label*,char**);
@@ -105,10 +138,12 @@ void nothing(label*,char**);
 void include(label*,char**);
 void incbin(label*,char**);
 void dw(label*,char**);
+void dwb(label*,char**);
 void db(label*,char**);
 void dl(label*,char**);
 void dh(label*,char**);
 void hex(label*,char**);
+void bin(label*,char**);
 void dsw(label*,char**);
 void dsb(label*,char**);
 void align(label*,char**);
@@ -124,71 +159,99 @@ void endr(label*,char**);
 void rept(label*,char**);
 void _enum(label*,char**);
 void ende(label*,char**);
+void ram(label*,char**);
+void endram(label*,char**);
+void wram(label*,char**);
+void endwram(label*,char**);
+void sram(label*,char**);
+void endsram(label*,char**);
 void fillval(label*,char**);
 void expandmacro(label*,char**,int,char*);
 void expandrept(int,char*);
 void make_error(label*,char**);
+void make_message(label*,char**);
 
-enum optypes {ACC,IMM,IND,INDX,INDY,ZPX,ZPY,ABSX,ABSY,ZP,ABS,REL,IMP};
-int opsize[]={0,1,2,1,1,1,1,2,2,1,2,1,0};
-char ophead[]={0,'#','(','(','(',0,0,0,0,0,0,0,0};
-char *optail[]={"A","",")",",X)","),Y",",X",",Y",",X",",Y","","","",""};
-byte brk[]={0x00,IMM,0x00,ZP,0x00,IMP,-1};
-byte ora[]={0x09,IMM,0x01,INDX,0x11,INDY,0x15,ZPX,0x1d,ABSX,0x19,ABSY,0x05,ZP,0x0d,ABS,-1};
-byte asl[]={0x0a,ACC,0x16,ZPX,0x1e,ABSX,0x06,ZP,0x0e,ABS,0x0a,IMP,-1};
-byte php[]={0x08,IMP,-1};
-byte bpl[]={0x10,REL,-1};
-byte clc[]={0x18,IMP,-1};
-byte jsr[]={0x20,ABS,-1};
-byte and[]={0x29,IMM,0x21,INDX,0x31,INDY,0x35,ZPX,0x3d,ABSX,0x39,ABSY,0x25,ZP,0x2d,ABS,-1};
-byte bit[]={0x24,ZP,0x2c,ABS,-1};
-byte rol[]={0x2a,ACC,0x36,ZPX,0x3e,ABSX,0x26,ZP,0x2e,ABS,0x2a,IMP,-1};
-byte plp[]={0x28,IMP,-1};
-byte bmi[]={0x30,REL,-1};
-byte sec[]={0x38,IMP,-1};
-byte rti[]={0x40,IMP,-1};
-byte eor[]={0x49,IMM,0x41,INDX,0x51,INDY,0x55,ZPX,0x5d,ABSX,0x59,ABSY,0x45,ZP,0x4d,ABS,-1};
-byte lsr[]={0x4a,ACC,0x56,ZPX,0x5e,ABSX,0x46,ZP,0x4e,ABS,0x4a,IMP,-1};
-byte pha[]={0x48,IMP,-1};
-byte jmp[]={0x6c,IND,0x4c,ABS,-1};
-byte bvc[]={0x50,REL,-1};
-byte cli[]={0x58,IMP,-1};
-byte rts[]={0x60,IMP,-1};
-byte adc[]={0x69,IMM,0x61,INDX,0x71,INDY,0x75,ZPX,0x7d,ABSX,0x79,ABSY,0x65,ZP,0x6d,ABS,-1};
-byte ror[]={0x6a,ACC,0x76,ZPX,0x7e,ABSX,0x66,ZP,0x6e,ABS,0x6a,IMP,-1};
-byte pla[]={0x68,IMP,-1};
-byte bvs[]={0x70,REL,-1};
-byte sei[]={0x78,IMP,-1};
-byte sta[]={0x81,INDX,0x91,INDY,0x95,ZPX,0x9d,ABSX,0x99,ABSY,0x85,ZP,0x8d,ABS,-1};
-byte sty[]={0x94,ZPX,0x84,ZP,0x8c,ABS,-1};
-byte stx[]={0x96,ZPY,0x86,ZP,0x8e,ABS,-1};
-byte dey[]={0x88,IMP,-1};
-byte txa[]={0x8a,IMP,-1};
-byte bcc[]={0x90,REL,-1};
-byte tya[]={0x98,IMP,-1};
-byte txs[]={0x9a,IMP,-1};
-byte ldy[]={0xa0,IMM,0xb4,ZPX,0xbc,ABSX,0xa4,ZP,0xac,ABS,-1};
-byte lda[]={0xa9,IMM,0xa1,INDX,0xb1,INDY,0xb5,ZPX,0xbd,ABSX,0xb9,ABSY,0xa5,ZP,0xad,ABS,-1};
-byte ldx[]={0xa2,IMM,0xb6,ZPY,0xbe,ABSY,0xa6,ZP,0xae,ABS,-1};
-byte tay[]={0xa8,IMP,-1};
-byte tax[]={0xaa,IMP,-1};
-byte bcs[]={0xb0,REL,-1};
-byte clv[]={0xb8,IMP,-1};
-byte tsx[]={0xba,IMP,-1};
-byte cpy[]={0xc0,IMM,0xc4,ZP,0xcc,ABS,-1};
-byte cmp[]={0xc9,IMM,0xc1,INDX,0xd1,INDY,0xd5,ZPX,0xdd,ABSX,0xd9,ABSY,0xc5,ZP,0xcd,ABS,-1};
-byte dec[]={0xd6,ZPX,0xde,ABSX,0xc6,ZP,0xce,ABS,-1};
-byte iny[]={0xc8,IMP,-1};
-byte dex[]={0xca,IMP,-1};
-byte bne[]={0xd0,REL,-1};
-byte cld[]={0xd8,IMP,-1};
-byte cpx[]={0xe0,IMM,0xe4,ZP,0xec,ABS,-1};
-byte sbc[]={0xe9,IMM,0xe1,INDX,0xf1,INDY,0xf5,ZPX,0xfd,ABSX,0xf9,ABSY,0xe5,ZP,0xed,ABS,-1};
-byte inc[]={0xf6,ZPX,0xfe,ABSX,0xe6,ZP,0xee,ABS,-1};
-byte inx[]={0xe8,IMP,-1};
-byte nop[]={0xea,IMP,-1};
-byte beq[]={0xf0,REL,-1};
-byte sed[]={0xf8,IMP,-1};
+// ================================================================================
+//		OPCODE TABLE
+// ================================================================================
+enum optypes   {ACC,    IMM,    IND,    INDX,   INDY,   ZPX,    ZPY,    ABSX,   ABSY,   ZP,     ABS,    REL,    IMP,    ZPL,    ZPXL,   ZPYL	};
+int opsize[]  ={0,      1,      2,      1,      1,      1,      1,      2,      2,      1,      2,      1,      0,      2,      2,      2		};
+char ophead[] ={0,      '#',    '(',    '(',    '(',    0,      0,      0,      0,      0,      0,      0,      0,      '!',    '!',    '!'		};
+char *optail[]={"A",    "",     ")",    ",X)",  "),Y",  ",X",   ",Y",   ",X",   ",Y",   "",     "",     "",     "",     "",     ",X",   ",Y"	};
+
+byte brk[]={0x00,IMM,  0x00,ZP,   0x00,IMP,  -1};
+byte ora[]={0x09,IMM,  0x01,INDX, 0x11,INDY, 0x1d,ZPXL, 0x15,ZPX,  0x1d,ABSX, 0x19,ABSY, 0x0d,ZPL,  0x05,ZP,   0x0d,ABS,  -1};
+byte asl[]={0x0a,ACC,  0x1e,ZPXL, 0x16,ZPX,  0x1e,ABSX, 0x0e,ZPL,  0x06,ZP,   0x0e,ABS,  0x0a,IMP,  -1};
+byte php[]={0x08,IMP,  -1};
+byte bpl[]={0x10,REL,  -1};
+byte clc[]={0x18,IMP,  -1};
+byte jsr[]={0x20,ABS,  -1};
+byte and[]={0x29,IMM,  0x21,INDX, 0x31,INDY, 0x3d,ZPXL, 0x35,ZPX,  0x3d,ABSX, 0x39,ABSY, 0x2d,ZPL,  0x25,ZP,   0x2d,ABS,  -1};
+byte bit[]={0x2c,ZPL,  0x24,ZP,   0x2c,ABS,  -1};
+byte rol[]={0x2a,ACC,  0x3e,ZPXL, 0x36,ZPX,  0x3e,ABSX, 0x2e,ZPL,  0x26,ZP,   0x2e,ABS,  0x2a,IMP,  -1};
+byte plp[]={0x28,IMP,  -1};
+byte bmi[]={0x30,REL,  -1};
+byte sec[]={0x38,IMP,  -1};
+byte rti[]={0x40,IMP,  -1};
+byte eor[]={0x49,IMM,  0x41,INDX, 0x51,INDY, 0x5d,ZPXL, 0x55,ZPX,  0x5d,ABSX, 0x59,ABSY, 0x4d,ZPL,  0x45,ZP,   0x4d,ABS,  -1};
+byte lsr[]={0x4a,ACC,  0x5e,ZPXL, 0x56,ZPX,  0x5e,ABSX, 0x4e,ZPL,  0x46,ZP,   0x4e,ABS,  0x4a,IMP,  -1};
+byte pha[]={0x48,IMP,  -1};
+byte jmp[]={0x6c,IND,  0x4c,ABS,  -1};
+byte bvc[]={0x50,REL,  -1};
+byte cli[]={0x58,IMP,  -1};
+byte rts[]={0x60,IMP,  -1};
+byte adc[]={0x69,IMM,  0x61,INDX, 0x71,INDY, 0x7d,ZPXL, 0x75,ZPX,  0x7d,ABSX, 0x79,ABSY, 0x6d,ZPL, 0x65,ZP,   0x6d,ABS,  -1};
+byte ror[]={0x6a,ACC,  0x7e,ZPXL, 0x76,ZPX,  0x7e,ABSX, 0x6e,ZPL,  0x66,ZP,   0x6e,ABS,  0x6a,IMP,  -1};
+byte pla[]={0x68,IMP,  -1};
+byte bvs[]={0x70,REL,  -1};
+byte sei[]={0x78,IMP,  -1};
+byte sta[]={0x81,INDX, 0x91,INDY, 0x9d,ZPXL, 0x95,ZPX,  0x9d,ABSX, 0x99,ABSY, 0x8d,ZPL,  0x85,ZP,   0x8d,ABS,  -1};
+byte sty[]={0x94,ZPX,  0x8c,ZPL,  0x84,ZP,   0x8c,ABS,  -1};
+byte stx[]={0x96,ZPY,  0x8e,ZPL,  0x86,ZP,   0x8e,ABS,  -1};
+byte dey[]={0x88,IMP,  -1};
+byte txa[]={0x8a,IMP,  -1};
+byte bcc[]={0x90,REL,  -1};
+byte tya[]={0x98,IMP,  -1};
+byte txs[]={0x9a,IMP,  -1};
+byte ldy[]={0xa0,IMM,  0xbc,ZPXL, 0xb4,ZPX,  0xbc,ABSX, 0xac,ZPL,  0xa4,ZP,   0xac,ABS,  -1};
+byte lda[]={0xa9,IMM,  0xa1,INDX, 0xb1,INDY, 0xbd,ZPXL, 0xb5,ZPX,  0xbd,ABSX, 0xb9,ABSY, 0xad,ZPL,  0xa5,ZP,   0xad,ABS,  -1};
+byte ldx[]={0xa2,IMM,  0xbe,ZPYL, 0xb6,ZPY,  0xbe,ABSY, 0xae,ZPL,  0xa6,ZP,   0xae,ABS,  -1};
+byte tay[]={0xa8,IMP,  -1};
+byte tax[]={0xaa,IMP,  -1};
+byte bcs[]={0xb0,REL,  -1};
+byte clv[]={0xb8,IMP,  -1};
+byte tsx[]={0xba,IMP,  -1};
+byte cpy[]={0xc0,IMM,  0xcc,ZPL,  0xc4,ZP,   0xcc,ABS,  -1};
+byte cmp[]={0xc9,IMM,  0xc1,INDX, 0xd1,INDY, 0xdd,ZPXL, 0xd5,ZPX,  0xdd,ABSX, 0xd9,ABSY, 0xcd,ZPL,  0xc5,ZP,   0xcd,ABS,  -1};
+byte dec[]={0xde,ZPXL, 0xd6,ZPX,  0xde,ABSX, 0xce,ZPL,  0xc6,ZP,   0xce,ABS,  -1};
+byte iny[]={0xc8,IMP,  -1};
+byte dex[]={0xca,IMP,  -1};
+byte bne[]={0xd0,REL,  -1};
+byte cld[]={0xd8,IMP,  -1};
+byte cpx[]={0xe0,IMM,  0xec,ZPL,  0xe4,ZP,   0xec,ABS,  -1};
+byte sbc[]={0xe9,IMM,  0xe1,INDX, 0xf1,INDY, 0xfd,ZPXL, 0xf5,ZPX,  0xfd,ABSX, 0xf9,ABSY, 0xed,ZPL,  0xe5,ZP,   0xed,ABS,  -1};
+byte inc[]={0xfe,ZPXL, 0xf6,ZPX,  0xfe,ABSX, 0xee,ZPL,  0xe6,ZP,   0xee,ABS,  -1};
+byte inx[]={0xe8,IMP,  -1};
+byte nop[]={0xea,IMP,  -1};
+byte beq[]={0xf0,REL,  -1};
+byte sed[]={0xf8,IMP,  -1};
+
+// illegal opcodes [based on asm6f]	->	http://www.oxyron.de/html/opcodes02.html
+byte slo[]={0x03,INDX, 0x13,INDY, 0x1F,ZPXL, 0x17,ZPX,  0x1F,ABSX, 0x1B,ABSY, 0x0F,ZPL,  0x07,ZP,   0x0F,ABS,  -1};
+byte rla[]={0x23,INDX, 0x33,INDY, 0x3F,ZPXL, 0x37,ZPX,  0x3F,ABSX, 0x3B,ABSY, 0x2F,ZPL,  0x27,ZP,   0x2F,ABS,  -1};
+byte sre[]={0x43,INDX, 0x53,INDY, 0x5F,ZPXL, 0x57,ZPX,  0x5F,ABSX, 0x5B,ABSY, 0x4F,ZPL,  0x47,ZP,   0x4F,ABS,  -1};
+byte rra[]={0x63,INDX, 0x73,INDY, 0x7F,ZPXL, 0x77,ZPX,  0x7F,ABSX, 0x7B,ABSY, 0x6F,ZPL,  0x67,ZP,   0x6F,ABS,  -1};
+byte sax[]={0x83,INDX, 0x97,ZPY,  0x8F,ZPL,  0x87,ZP,   0x8F,ABS,  -1};
+byte lax[]={0xA3,INDX, 0xB3,INDY, 0xBF,ZPYL, 0xB7,ZPY,  0xBF,ABSY, 0xAF,ZPL,  0xA7,ZP,   0xAF,ABS,  -1};
+byte dcp[]={0xC3,INDX, 0xD3,INDY, 0xDF,ZPXL, 0xD7,ZPX,  0xDF,ABSX, 0xDB,ABSY, 0xCF,ZPL,  0xC7,ZP,   0xCF,ABS,  -1};
+byte isc[]={0xE3,INDX, 0xF3,INDY, 0xFF,ZPXL, 0xF7,ZPX,  0xFF,ABSX, 0xFB,ABSY, 0xEF,ZPL,  0xE7,ZP,   0xEF,ABS,  -1};
+byte anc[]={0x0B,IMM,  -1};
+byte alr[]={0x4B,IMM,  -1};
+byte arr[]={0x6B,IMM,  -1};
+byte axs[]={0xCB,IMM,  -1};
+byte las[]={0xBB,ABSY, -1};
+
+
  
 void *rsvdlist[]={       //all reserved words
         "BRK",brk,
@@ -247,6 +310,21 @@ void *rsvdlist[]={       //all reserved words
         "STX",stx,
         "DEC",dec,
         "INC",inc,
+
+		"SLO",slo,
+		"RLA",rla,
+		"SRE",sre,
+		"RRA",rra,
+		"SAX",sax,
+		"LAX",lax,
+		"DCP",dcp,
+		"ISC",isc,
+		"ANC",anc,
+		"ALR",alr,
+		"ARR",arr,
+		"AXS",axs,
+		"LAS",las,
+		
         0, 0
 };
 
@@ -265,14 +343,17 @@ struct {
         "EQU",equ,
         "ORG",org,
         "BASE",base,
+        "BANK",bank,
         "PAD",pad,
         "INCLUDE",include,"INCSRC",include,
-        "INCBIN",incbin,"BIN",incbin,
+        "INCBIN",incbin,
         "HEX",hex,
+	"BIN",bin,
         "WORD",dw,"DW",dw,"DCW",dw,"DC.W",dw,
+	"WORDB",dwb,"DWB",dwb,"DCWB",dwb,"DC.WB",dwb,
         "BYTE",db,"DB",db,"DCB",db,"DC.B",db,
         "DSW",dsw,"DS.W",dsw,
-        "DSB",dsb,"DS.B",dsb,
+        "DSB",dsb,"DS.B",dsb,"RS",dsb,
         "ALIGN",align,
         "MACRO",macro,
         "REPT",rept,
@@ -280,13 +361,23 @@ struct {
         "ENDR",endr,
         "ENUM",_enum,
         "ENDE",ende,
+	"RAM",ram,
+	"ENDRAM",endram,
+	"WRAM",wram,
+	"ENDWRAM",endwram,
+	"SRAM",sram,
+	"ENDSRAM",endsram,
         "FILLVALUE",fillval,
         "DL",dl,
         "DH",dh,
         "ERROR",make_error,
+	"PRINT",make_message,
         0, 0
 };
 
+// ================================================================================
+//		MESSAGES
+// ================================================================================
 char OutOfRange[]="Value out of range.";
 char SeekOutOfRange[]="Seek position out of range.";
 char BadIncbinSize[]="INCBIN size is out of range.";
@@ -303,6 +394,9 @@ char CantOpen[]="Can't open file.";
 char ExtraENDM[]="ENDM without MACRO.";
 char ExtraENDR[]="ENDR without REPT.";
 char ExtraENDE[]="ENDE without ENUM.";
+char ExtraENDRAM[]="ENDRAM without RAM.";
+char ExtraENDWRAM[]="ENDWRAM without WRAM.";
+char ExtraENDSRAM[]="ENDSRAM without SRAM.";
 char RecurseMACRO[]="Recursive MACRO not allowed.";
 char RecurseEQU[]="Recursive EQU not allowed.";
 char NoENDIF[]="Missing ENDIF.";
@@ -311,45 +405,56 @@ char NoENDR[]="Missing ENDR.";
 char NoENDE[]="Missing ENDE.";
 char IfNestLimit[]="Too many nested IFs.";
 char undefinedPC[]="PC is undefined (use ORG first)";
+char BadBankNumber[]="Bank number is invalid.";
 
-char whitesp[]=" \t\r\n:";  //treat ":" like whitespace (for labels)
-char whitesp2[]=" \t\r\n\"";    //(used for filename processing)
-char tmpstr[LINEMAX];   //all purpose big string
+
+
+// ================================================================================
+char whitesp[]=" \t\r\n:";		//treat ":" like whitespace (for labels)
+char whitesp2[]=" \t\r\n\"";	//(used for filename processing)
+char tmpstr[LINEMAX];			//all purpose big string
 
 int pass=0;
-int scope;//current scope, 0=global
-int nextscope;//next nonglobal scope (increment on each new block of localized code)
-int lastchance=0;//set on final attempt
-int needanotherpass;//still need to take care of some things..
-int error=0;//hard error (stop assembly after this pass)
-char **makemacro=0;//(during macro creation) where next macro line will go.  1 to skip past macro
-char **makerept;//like makemacro.. points to end of string chain
-int reptcount=0;//counts rept statements during rept string storage
-int iflevel=0;//index into ifdone[],skipline[]
-int ifdone[IFNESTS];//nonzero if current IF level has been true
-int skipline[IFNESTS];//1 on an IF statement that is false
+int scope;					//current scope, 0=global
+int nextscope;				//next nonglobal scope (increment on each new block of localized code)
+int lastchance=0;			//set on final attempt
+int needanotherpass;		//still need to take care of some things..
+int error=0;				//hard error (stop assembly after this pass)
+char **makemacro=0;			//(during macro creation) where next macro line will go.  1 to skip past macro
+char **makerept;			//like makemacro.. points to end of string chain
+int reptcount=0;			//counts rept statements during rept string storage
+int iflevel=0;				//index into ifdone[],skipline[]
+int ifdone[IFNESTS];		//nonzero if current IF level has been true
+int skipline[IFNESTS];		//1 on an IF statement that is false
 const char *errmsg;
 char *inputfilename=0;
 char *outputfilename=0;
 char *listfilename=0;
-int verboselisting=0;//expand REPT loops in listing
-const char *listerr=0;//error message for list file
-label *labelhere;//points to the label being defined on the current line (for EQU, =, etc)
+int verboselisting=0;		//expand REPT loops in listing
+const char *listerr=0;		//error message for list file
+label *labelhere;			//points to the label being defined on the current line (for EQU, =, etc)
 FILE *listfile=0;
 FILE *outputfile=0;
 byte outputbuff[BUFFSIZE];
 byte inputbuff[BUFFSIZE];
-int outcount;//bytes waiting in outputbuff
-label **labellist;  //array of label pointers (list starts from center and grows outward)
-int labels;//# of labels in labellist
-int maxlabels;//max # of labels labellist can hold
-int labelstart;//index of first label
-int labelend;//index of last label
-label *lastlabel;//last label created
-int nooutput=0;//supress output (use with ENUM)
-int defaultfiller;//default fill value
-int insidemacro=0;//macro/rept is being expanded
+int outcount;				//bytes waiting in outputbuff
+label **labellist;			//array of label pointers (list starts from center and grows outward)
+int labels;					//# of labels in labellist
+int maxlabels;				//max # of labels labellist can hold
+int labelstart;				//index of first label
+int labelend;				//index of last label
+label *lastlabel;			//last label created
+int nooutput=0;				//supress output (use with ENUM)
+int defaultfiller;			//default fill value
+int insidemacro=0;			//macro/rept is being expanded
 int verbose=1;
+
+int genmesenlabels=0; 		//generate label file for use with Mesen
+int mesenskiplocal=0;		//
+int genlualabels=0;			//generate ram label file for use with lua
+int labelsubtype=NONE;		//controls what type of label is being defined
+int filepos=0;
+int banknumber=-1;
 
 static void* ptr_from_bool( int b )
 {
@@ -445,6 +550,15 @@ int hexify(int i) {
     }
 }
 
+int binify(int i) {
+    if(i>='0' && i<='1') {
+        return i-'0';
+    } else {
+        errmsg=NotANumber;
+        return 0;
+    }
+}
+
 #define eatwhitespace(str) (*str+=strspn(*str,whitesp))
 
 //find end of str, excluding any chars in whitespace
@@ -471,6 +585,7 @@ int getvalue(char **str) {
     char *s,*end;
     int ret,chars,j;
     label *p;
+    int getbank=0;
 
     getword(gvline,str,1);
 
@@ -481,7 +596,7 @@ int getvalue(char **str) {
     }
     
     ret=chars=0;
-    if(*s=='$') {   //hex---------------------
+    if(*s=='$') {													//hex---------------------
         s++;
         if(!*s) {
             ret=addr;//$ by itself is the PC            
@@ -493,7 +608,7 @@ hexi:       j=hexify(*s);
         } while(*s);
         if(chars>8)
             errmsg=OutOfRange;
-    } else if(*s=='%') {    //binary----------------------
+    } else if(*s=='%') {											//binary----------------------
         s++;
     do {
 bin:        j=*s;
@@ -507,21 +622,21 @@ bin:        j=*s;
         } while(*s);
         if(chars>32)
             errmsg=OutOfRange;
-    } else if(*s=='\'') {   //char-----------------
+    } else if(*s=='\'') {											//char-----------------
         s++;
         if(*s=='\\') s++;
         ret=*s;
         s++;
         if(*s!='\'')
             errmsg=NotANumber;
-    } else if(*s=='"') {    //char 2-----------------
+    } else if(*s=='"') {											//char 2-----------------
         s++;
         if(*s=='\\') s++;
         ret=*s;
         s++;
         if(*s!='"')
             errmsg=NotANumber;
-    } else if(*s>='0' && *s<='9') {//number--------------
+    } else if(*s>='0' && *s<='9') {									//number--------------
         end=s+strlen(s)-1;
         if(strspn(s,"0123456789")==strlen(s))
             ret=atoi(s);
@@ -533,7 +648,17 @@ bin:        j=*s;
             goto hexi;
         } else
             errmsg=NotANumber;
-    } else {    //label---------------
+    } else {														//label---------------
+    
+		if (*s==BANKCHAR)
+		{
+			getbank=1;
+			s++;
+			getword(gvline,&s,1);
+		}
+		else
+			getbank=0;
+    
         p=findlabel(gvline);
         if(!p) {//label doesn't exist (yet?)
             needanotherpass=dependant=1;
@@ -544,7 +669,10 @@ bin:        j=*s;
             dependant|=!(*p).line;
             needanotherpass|=!(*p).line;
             if((*p).type==LABEL || (*p).type==VALUE) {
-                ret=(*p).value;
+            	if (getbank)
+            		ret=(*p).bank;
+            	else
+                	ret=(*p).value;
             } else if((*p).type==MACRO) {
                 errmsg="Can't use macro in expression.";
             } else {//what else is there?
@@ -628,12 +756,13 @@ int getoperator(char **str) {
 //evaluate expression in str and advance str
 int eval(char **str,int precedence) {
     char unary;
-    char *s,*s2;
+    char *s,*s2, *sb;
     int ret,val2;
     int op;
     
     s=*str+strspn(*str,whitesp);        //eatwhitespace
     unary=*s;
+    sb=s-1;					// get char before current
     switch(unary) {
         case '(':
             s++;
@@ -653,8 +782,11 @@ int eval(char **str,int precedence) {
             ret=~eval(&s,UNARY);
             break;
         case '!':
-            s++;
-            ret=!eval(&s,UNARY);
+        	s++;
+        	if (( *sb != ' ' ) && (*sb != '\t'))
+            	ret=!eval(&s,UNARY);
+            else
+            	ret=eval(&s,WHOLEEXP);					// force absolute
             break;
         case '<':
             s++;
@@ -990,11 +1122,15 @@ void addlabel(char *word, int local) {
         labelhere=newlabel();
         if(!(*labelhere).name)//name already set if it's a duplicate
             (*labelhere).name=my_strdup(word);
-        (*labelhere).type=LABEL;//assume it's a label.. could mutate into something else later
+        (*labelhere).type=LABEL;				// assume it's a label.. could mutate into something else later
+        (*labelhere).subtype=labelsubtype;		// set subtype
+        (*labelhere).bank=banknumber;			// set bank
         (*labelhere).pass=pass;
         (*labelhere).value=addr;
         (*labelhere).line=ptr_from_bool(addr>=0);
         (*labelhere).used=0;
+		(*labelhere).pos=filepos;
+		
         if(c==LOCALCHAR || local) { //local
             (*labelhere).scope=scope;
         } else {        //global
@@ -1017,6 +1153,7 @@ void addlabel(char *word, int local) {
                         errmsg=BadAddr;
                 }
                 (*p).value=addr;
+				(*p).pos=filepos;
                 (*p).line=ptr_from_bool(addr>=0);
                 if(lastchance && addr<0)
                     errmsg=BadAddr;
@@ -1342,7 +1479,117 @@ void showhelp(void) {
     puts("See README.TXT for more info.\n");
 }
 
+
+
+
+
+
+
 //--------------------------------------------------------------------------------------------
+
+int comparelabels(const void* arg1, const void* arg2)
+{
+	const label* a = *((label**)arg1);
+	const label* b = *((label**)arg2);
+	if(a->type > b->type) return 1;
+	if(a->type < b->type) return -1;
+	if(a->pos > b->pos) return 1;
+	if(a->pos < b->pos) return -1;
+	if(a->value > b->value) return 1;
+	if(a->value < b->value) return -1;
+	return strcmp(a->name, b->name);
+}
+
+void export_mesenlabels() 
+{
+	int i;
+	label *l;
+	char str[512];
+	char filename[512];
+	char *strptr;
+	FILE* outfile;
+	
+	strcpy(filename, outputfilename);
+
+	strptr = strrchr(filename, '.'); // strptr ='.'ptr
+	if(strptr) if(strchr(strptr, '\\')) strptr = 0; // watch out for "dirname.ext\listfile"
+	if(!strptr) strptr = filename + strlen(filename); // strptr -> inputfile extension
+	strcpy(strptr, ".mlb");
+
+	outfile = fopen(filename, "w");
+
+	qsort(labellist + labelstart, labelend - labelstart + 1, sizeof(label*), comparelabels);
+	
+	for(i = labelstart; i<=labelend; i++)
+	{
+		l = labellist[i];
+		
+		// ignore CHR & anonymous code labels
+		if(l->value >= 0x10000 || l->name[0] == '+' || l->name[0] == '-' || l->value < 0)
+			continue;
+
+		// ignore local labels
+		if ( mesenskiplocal && (l->name[0] == LOCALCHAR) )
+			continue;
+		
+		if ( (l->type == LABEL) && (l->subtype != CONST) )
+		{
+			if (l->subtype == NONE)
+				sprintf(str, "P:%04X:%s\n", (unsigned int)(l->pos - 16), l->name);
+			//	sprintf(str, "P:%04X:%s\n", (unsigned int)l->value, l->name);
+			else if (l->subtype == RAM)
+				sprintf(str, "R:%04X:%s\n", (unsigned int)l->value, l->name);
+			else if (l->subtype == WRAM)
+				sprintf(str, "W:%04X:%s\n", (unsigned int)l->value - 0x6000, l->name);
+			else if (l->subtype == SRAM)
+				sprintf(str, "S:%04X:%s\n", (unsigned int)l->value - 0x6000, l->name);
+			else
+				sprintf(str, "G:%04X:%s\n", (unsigned int)l->value, l->name);
+			fwrite((const void *)str, 1, strlen(str), outfile);
+		}
+	}
+	
+	fclose(outfile);
+}
+
+void export_lualabels()
+{
+	int i;
+	label *l;
+	char str[512];
+	FILE* outfile;
+	
+	outfile = fopen("ram.lua", "w");
+
+	qsort(labellist + labelstart, labelend - labelstart + 1, sizeof(label*), comparelabels);
+	
+	for(i = labelstart; i<=labelend; i++)
+	{
+		l = labellist[i];
+		
+		// ignore CHR & anonymous code labels
+		if(l->value >= 0x10000 || l->name[0] == '+' || l->name[0] == '-' || l->value < 0)
+			continue;
+
+		if (l->type == LABEL)
+		{
+			switch (l->subtype)
+			{
+				case RAM:
+				case WRAM:
+				case SRAM:
+					sprintf(str, "%s\t\t= 0x%04X\n", l->name, (unsigned int)l->value);
+					fwrite((const void *)str, 1, strlen(str), outfile);
+					break;
+				
+				default:
+					continue;
+			}
+		}
+	}
+	
+	fclose(outfile);
+}
 
 int main(int argc,char **argv) {
     char str[512];
@@ -1384,6 +1631,14 @@ int main(int argc,char **argv) {
                 case 'q':
                     verbose = 0;
                     break;
+				case 'M':
+					mesenskiplocal=1;
+				case 'm':
+					genmesenlabels=1;
+					break;
+				case 'r':
+					genlualabels=1;
+					break;
                 default:
                     fatal_error("unknown option: %s",argv[i]);
             }
@@ -1431,6 +1686,7 @@ int main(int argc,char **argv) {
     //main assembly loop:
     p=0;
     do {
+		filepos=0;
         pass++;
         if(pass==MAXPASSES || (p==lastlabel))
             lastchance=1;//give up on too many tries or no progress made
@@ -1478,6 +1734,13 @@ int main(int argc,char **argv) {
     }
     if(listfile)
         listline(0,0);
+        
+	if (genmesenlabels)
+		export_mesenlabels();
+	
+	if (genlualabels)
+		export_lualabels();
+        
     return error ? EXIT_FAILURE : 0;
 }
 
@@ -1495,6 +1758,8 @@ void output(byte *p,int size) {
         return;
     }*/
     addr+=size;
+	if (!nooutput)
+		filepos+=size;
 
     if(nooutput)
         return;
@@ -1529,6 +1794,15 @@ static void output_le( int n, int size )
     byte b [2];
     b [0] = n;
     b [1] = n >> 8;
+    output( b, size );
+}
+
+/* Outputs integer as big-endian. See readme.txt for proper usage. */
+static void output_be( int n, int size )
+{
+    byte b [2];
+    b [0] = n >> 8;
+    b [1] = n;
     output( b, size );
 }
 
@@ -1577,6 +1851,7 @@ void listline(char *src,char *comment) {
         message("%s written.\n",listfilename);
     }
 }
+
 //------------------------------------------------------
 //directive(label *id, char **next)
 //
@@ -1624,6 +1899,18 @@ void base(label *id, char **next) {
         addr=val;
     else
         addr=NOORIGIN;//undefine origin
+}
+
+void bank(label *id, char **next)
+{
+	int val = eval(next,WHOLEEXP);
+	if (val < 0)
+	{
+		errmsg=BadBankNumber;
+		error=1;
+	}
+	else
+		banknumber = val;
 }
 
 //nothing to do (empty line)
@@ -1718,6 +2005,36 @@ void hex(label *id,char **next) {
     } while(*buff);
 }
 
+void bin(label *id,char **next)
+{
+    char buff[LINEMAX];
+    char *src;
+    int dst, i;
+    char c, v;
+    getword(buff,next,0);
+    if(!*buff) errmsg=MissingOperand;
+    else do {
+        src=buff;
+        dst=0;
+        do {
+			v=0;
+			for (i = 0; i < 8; i++)
+			{
+				if(*src) {
+					c = binify(*src);
+					v = (v << 1) + c;
+					src++;
+				} else {//deal with odd number of chars
+					v = v << 1;
+				}
+			}
+            buff[dst++] = v;
+        } while(*src);
+        output((byte*)buff,dst);
+        getword(buff,next,0);
+    } while(*buff);
+}
+
 void dw(label *id, char **next) {
     int val;
     do {
@@ -1727,6 +2044,19 @@ void dw(label *id, char **next) {
                 errmsg=OutOfRange;
             else
                 output_le(val,2);
+        }
+    } while(!errmsg && eatchar(next,','));
+}
+
+void dwb(label *id, char **next) {
+    int val;
+    do {
+        val=eval(next,WHOLEEXP);
+        if(!errmsg) {
+            if(val>65535 || val<-65536)
+                errmsg=OutOfRange;
+            else
+                output_be(val,2);
         }
     } while(!errmsg && eatchar(next,','));
 }
@@ -2157,6 +2487,7 @@ void expandrept(int errline,char *errsrc) {
 }
 
 int enum_saveaddr;
+int enum_savesubtype;
 void _enum(label *id, char **next) {       
     int val=0;
     dependant=0;
@@ -2167,6 +2498,8 @@ void _enum(label *id, char **next) {
         enum_saveaddr=addr;
     addr=val;
     nooutput=1;
+    enum_savesubtype=labelsubtype;
+    labelsubtype=CONST;
 }
 
 void ende(label *id, char **next) {
@@ -2176,14 +2509,101 @@ void ende(label *id, char **next) {
     } else {
         errmsg=ExtraENDE;
     }
+    labelsubtype=enum_savesubtype;
 }
+
+int ram_saveaddr;
+int ram_savesubtype;
+void ram(label *id, char **next)
+{       
+    int val=0;
+    dependant=0;
+    val=eval(next,WHOLEEXP);
+//  if(!dependant && !errmsg) {
+//  }
+    if(!nooutput)
+        ram_saveaddr=addr;
+    addr=val;
+    nooutput=1;
+    ram_savesubtype=labelsubtype;
+    labelsubtype=RAM;
+}
+
+void endram(label *id, char **next)
+{
+    if(nooutput) {
+        addr=ram_saveaddr;
+        nooutput=0;
+    } else {
+        errmsg=ExtraENDRAM;
+    }
+    labelsubtype=ram_savesubtype;
+}
+
+int wram_saveaddr;
+int wram_savesubtype;
+void wram(label *id, char **next)
+{       
+    int val=0;
+    dependant=0;
+    val=eval(next,WHOLEEXP);
+//  if(!dependant && !errmsg) {
+//  }
+    if(!nooutput)
+        wram_saveaddr=addr;
+    addr=val;
+    nooutput=1;
+    wram_savesubtype=labelsubtype;
+    labelsubtype=WRAM;
+}
+
+void endwram(label *id, char **next)
+{
+    if(nooutput) {
+        addr=wram_saveaddr;
+        nooutput=0;
+    } else {
+        errmsg=ExtraENDWRAM;
+    }
+    labelsubtype=wram_savesubtype;
+}
+
+int sram_saveaddr;
+int sram_savesubtype;
+void sram(label *id, char **next)
+{       
+    int val=0;
+    dependant=0;
+    val=eval(next,WHOLEEXP);
+//  if(!dependant && !errmsg) {
+//  }
+    if(!nooutput)
+        sram_saveaddr=addr;
+    addr=val;
+    nooutput=1;
+    sram_savesubtype=labelsubtype;
+    labelsubtype=SRAM;
+}
+
+void endsram(label *id, char **next)
+{
+    if(nooutput) {
+        addr=sram_saveaddr;
+        nooutput=0;
+    } else {
+        errmsg=ExtraENDSRAM;
+    }
+    labelsubtype=sram_savesubtype;
+}
+
 
 void fillval(label *id,char **next) {
     dependant=0;
     defaultfiller=eval(next,WHOLEEXP);
 }
 
-void make_error(label *id,char **next) {
+void make_error(label *id,char **next)
+{
     char *s=*next;
     reverse(tmpstr,s+strspn(s,whitesp2));       //eat whitesp, quotes off both ends
     reverse(s,tmpstr+strspn(tmpstr,whitesp2));
@@ -2191,3 +2611,23 @@ void make_error(label *id,char **next) {
     error=1;
     *next=s+strlen(s);
 }
+
+void make_message(label *id,char **next)
+{
+	char *s=*next;
+	reverse(tmpstr,s+strspn(s,whitesp2));       //eat whitesp, quotes off both ends
+	reverse(s,tmpstr+strspn(tmpstr,whitesp2));
+	if (pass == 1)
+	{
+		message(s);
+		message("\n");
+	}
+	*next=s+strlen(s);
+}
+
+
+
+
+
+
+
