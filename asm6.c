@@ -1,6 +1,10 @@
 
 
 /*  asm6n History:
+1.7.4
+	* Added -i (pass count) command line option
+	* Bugfix using bank operator '?' on special label '$' would always return 0
+
 1.7.3
 	* Added support for label sizes (RAM,SRAM,WRAM blocks only)
 
@@ -59,7 +63,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-#define VERSION "1.7.3"
+#define VERSION "1.7.4"
 
 #define addr firstlabel.value	//'$' value
 #define NOORIGIN -0x40000000	//nice even number so aligning works before origin is defined
@@ -491,6 +495,7 @@ int labelsubtype=NONE;		// controls what type of label is being defined
 int filepos=0;
 int banknumber=-1;
 int addtolabelsize=0;		// add the size of output to 'lastlabel' size
+int maxpasses=MAXPASSES;	// maximum number of passes before failure
 
 static void* ptr_from_bool( int b )
 {
@@ -706,7 +711,12 @@ bin:        j=*s;
             needanotherpass|=!(*p).line;
             if((*p).type==LABEL || (*p).type==VALUE) {
             	if (getbank)
-            		ret=(*p).bank;
+            	{
+            		if ( strcmp( (*p).name, "$" ) == 0 )
+            			ret=banknumber;
+            		else
+            			ret=(*p).bank;
+            	}
             	else
                 	ret=(*p).value;
             } else if((*p).type==MACRO) {
@@ -1506,13 +1516,18 @@ badlabel:
 
 void showhelp(void) {
     puts("");
-    puts("asm6 " VERSION "\n");
+    puts("asm6n " VERSION "\n");
     puts("Usage:  asm6 [-options] sourcefile [outputfile] [listfile]\n");
-    puts("    -?          show this help");
-    puts("    -l          create listing");
-    puts("    -L          create verbose listing (expand REPT, MACRO)");
-    puts("    -d<name>    define symbol");
-    puts("    -q          quiet mode (no output unless error)\n");
+    puts("    -?            show this help");
+    puts("    -l            create listing");
+    puts("    -L            create verbose listing (expand REPT, MACRO)");
+    puts("    -d<name>      define symbol");
+    puts("    -q            quiet mode (no output unless error)\n");
+    puts("    -m            generate *.mlb file for use with Mesen\n");
+    puts("    -M            generate *.mlb file for use with Mesen, ingorning local labels\n");
+    puts("    -r            generate *.lua file with all ram/wram/sram labels\n");
+    puts("    -p <romfile>  patch over a ines rom image\n");
+    puts("    -i <count>    number of passes before failure (default=7)\n");
     puts("See README.TXT for more info.\n");
 }
 
@@ -1749,6 +1764,15 @@ int main(int argc,char **argv) {
 					{
 						patchrom=1;
 						readrom(argv[i]);
+					}
+					break;
+				case 'i':
+					i++;
+					if (i<argc)
+					{
+						maxpasses = atoi(argv[i]);
+						if (maxpasses < MAXPASSES)
+							maxpasses = MAXPASSES;
 					}
 					break;
                 default:

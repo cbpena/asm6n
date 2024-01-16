@@ -1,5 +1,5 @@
 --------------------------------------------------------------
-ASM6N (v1.7.3)
+ASM6N (v1.7.4)
 A 6502 assembler by loopy (loopy at mm.st)
 With modifications by never-obsolete, freem, nicklausw, and Sour
 --------------------------------------------------------------
@@ -12,6 +12,9 @@ original README for further details on usage.
 --------------------------------------------------------------
 Additions
 --------------------------------------------------------------
+ v 1.7.4
+	* Added -i (pass count) command line option
+	* Bugfix using bank operator '?' on special label '$' would always return 0
 
  v 1.7.3
 	* Added support to export label sizes in RAM,SRAM,WRAM blocks
@@ -40,7 +43,7 @@ Command line
 
 Usage:
 
-        asm6 [-options] sourcefile [outputfile] [listfile]
+        asm6n [-options] sourcefile [outputfile] [listfile]
 
 Options:
 
@@ -49,10 +52,11 @@ Options:
         -L            Create verbose listing (expand REPT, MACRO)
         -d<name>:     Define a symbol and make it equal to 1
 	-q            Quiet mode (suppress all output unless there's an error)
-	-m            generate *.mlb file for use with Mesen
-	-M            generate *.mlb file for use with Mesen, ingorning local labels
-	-r            generate *.lua file with all ram/wram/sram labels
+	-m            Generate *.mlb file for use with Mesen
+	-M            Generate *.mlb file for use with Mesen, ingorning local labels
+	-r            Generate *.lua file with all ram/wram/sram labels
 	-p <romfile>  Patch over a ines rom image.
+	-i <count>    Number of passes before failure (default=7)
         Default output is <sourcefile>.bin
         Default listing is <sourcefile>.lst
 
